@@ -19,7 +19,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 TRAEFIK = "docker.io/traefik@sha256:575fa15b135078fe5e50aa847987d96dbddd7b093c172429618404df73f3fa7c"
-REDIS = "ecr-public.aws.com/docker/library/redis@sha256:0bf6577d7774e592b29d093e3ac9390eb91e13d72c21e506afce736de5e0eeb0"
+REDIS = "ecr-public.aws.com/docker/library/redis@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0"
 PYTHON = (
     "python@sha256:c50ccfb66e5cc97a610dcd0b9597de6ef5b52c96280b51997b353a0fc87a8361"
 )
