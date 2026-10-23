@@ -53,32 +53,14 @@ const (
 
 var errAppsecGetBody = errors.New("appsecQuery:GetBody")
 
-// ##############################################################
-// Important: traefik creates an instance of the bouncer per route.
-// We rely on globals (both here and in the memory cache) to share info between
-// routes. This means that some of the plugins parameters will only work "once"
-// and will take the values of the first middleware that was instantiated even
-// if you have different middlewares with different parameters. This design
-// makes it impossible to have multiple crowdsec implementations per cluster (unless you have multiple traefik deployments in it)
-// - updateInterval
-// - updateMaxFailure
-// - defaultDecisionTimeout
-// - redisUnreachableBlock
-// - appsecEnabled
-// - appsecHost
-// - metricsUpdateIntervalSeconds
-// - others...
-// ###################################
-
+// Metrics remain shared across routes. Stream state and refresh lifetimes belong
+// to each middleware instance so replacement configurations use their own cache.
+//
 //nolint:gochecknoglobals
 var (
-	isCrowdsecStreamStartup = true
-	isCrowdsecStreamHealthy = true
-	updateFailure           int64
-	streamTicker            *time.Ticker
-	metricsTicker           *time.Ticker
-	lastMetricsPush         time.Time
-	blockedRequests         int64
+	metricsTicker   *time.Ticker
+	lastMetricsPush time.Time
+	blockedRequests int64
 )
 
 // CreateConfig creates the default plugin configuration.
@@ -88,9 +70,13 @@ func CreateConfig() *configuration.Config {
 
 // Bouncer a Bouncer struct.
 type Bouncer struct {
-	next     http.Handler
-	name     string
-	template *template.Template
+	streamHealthy     int32
+	streamStartup     int32
+	updateFailures    int64
+	streamLastSuccess int64
+	next              http.Handler
+	name              string
+	template          *template.Template
 
 	enabled                   bool
 	appsecEnabled             bool
@@ -142,8 +128,8 @@ type AppSecResponse struct {
 
 // New creates the crowdsec bouncer plugin.
 //
-//nolint:nestif,gocyclo,gocognit,funlen,maintidx
-func New(_ context.Context, next http.Handler, config *configuration.Config, name string) (http.Handler, error) {
+//nolint:gocyclo,gocognit,funlen,maintidx
+func New(ctx context.Context, next http.Handler, config *configuration.Config, name string) (http.Handler, error) {
 	config.LogLevel = strings.ToUpper(config.LogLevel)
 	log := logger.NewWithFormat(config.LogLevel, config.LogFilePath, config.LogFormat)
 
@@ -218,9 +204,12 @@ func New(_ context.Context, next http.Handler, config *configuration.Config, nam
 	}
 
 	bouncer := &Bouncer{
-		next:     next,
-		name:     name,
-		template: template.New("CrowdsecBouncer").Delims("[[", "]]"),
+		streamLastSuccess: time.Now().UnixNano(),
+		streamHealthy:     1,
+		streamStartup:     1,
+		next:              next,
+		name:              name,
+		template:          template.New("CrowdsecBouncer").Delims("[[", "]]"),
 
 		enabled:                   config.Enabled,
 		crowdsecMode:              config.CrowdsecMode,
@@ -281,13 +270,15 @@ func New(_ context.Context, next http.Handler, config *configuration.Config, nam
 		captchaClient: &captcha.Client{},
 	}
 	config.RedisCachePassword, _ = configuration.GetVariable(config, "RedisCachePassword")
-	bouncer.cacheClient.New(
+	bouncer.cacheClient.NewWithACL(
 		log,
 		config.RedisCacheEnabled,
 		config.RedisCacheHost,
 		config.RedisCacheReadHosts,
+		config.RedisCacheUsername,
 		config.RedisCachePassword,
 		config.RedisCacheDatabase,
+		config.RedisCacheKeyPrefix,
 	)
 	config.CaptchaSiteKey, _ = configuration.GetVariable(config, "CaptchaSiteKey")
 	config.CaptchaSecretKey, _ = configuration.GetVariable(config, "CaptchaSecretKey")
@@ -317,7 +308,7 @@ func New(_ context.Context, next http.Handler, config *configuration.Config, nam
 		return bouncer, nil
 	}
 
-	if (config.CrowdsecMode == configuration.StreamMode || config.CrowdsecMode == configuration.AloneMode) && streamTicker == nil {
+	if config.CrowdsecMode == configuration.StreamMode || config.CrowdsecMode == configuration.AloneMode {
 		if config.CrowdsecMode == configuration.AloneMode {
 			if err := getToken(bouncer); err != nil {
 				bouncer.log.Error("New:getToken " + err.Error())
@@ -325,11 +316,10 @@ func New(_ context.Context, next http.Handler, config *configuration.Config, nam
 			}
 		}
 		if config.StreamStartupBlock {
+			atomic.StoreInt32(&bouncer.streamHealthy, 0)
 			handleStreamTicker(bouncer)
-		} else {
-			go handleStreamTicker(bouncer)
 		}
-		streamTicker = startTicker(config.UpdateIntervalSeconds, func() {
+		startContextTicker(ctx, config.UpdateIntervalSeconds, !config.StreamStartupBlock, func() {
 			handleStreamTicker(bouncer)
 		})
 	}
@@ -411,10 +401,10 @@ func (bouncer *Bouncer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// Right here if we cannot join the stream we forbid the request to go on.
 	if bouncer.crowdsecMode == configuration.StreamMode || bouncer.crowdsecMode == configuration.AloneMode {
-		if isCrowdsecStreamHealthy {
+		if atomic.LoadInt32(&bouncer.streamHealthy) == 1 {
 			bouncer.handleNextServeHTTP(rw, req, remoteIP)
 		} else {
-			bouncer.log.Debug(fmt.Sprintf("ServeHTTP isCrowdsecStreamHealthy:false ip:%s updateFailure:%d", remoteIP, updateFailure))
+			bouncer.log.Debug(fmt.Sprintf("ServeHTTP isCrowdsecStreamHealthy:false ip:%s updateFailure:%d", remoteIP, atomic.LoadInt64(&bouncer.updateFailures)))
 			bouncer.handleBanServeHTTP(rw, req, remoteIP, configuration.ReasonTECH)
 		}
 	} else {
@@ -582,16 +572,58 @@ func (bouncer *Bouncer) handleAppsecResponseServeHTTP(rw http.ResponseWriter, re
 
 func handleStreamTicker(bouncer *Bouncer) {
 	if err := handleStreamCache(bouncer); err != nil {
-		bouncer.log.Warn(fmt.Sprintf("handleStreamTicker updateFailure:%d isCrowdsecStreamHealthy:%t %s", updateFailure, isCrowdsecStreamHealthy, err.Error()))
-		if bouncer.updateMaxFailure != -1 && updateFailure >= bouncer.updateMaxFailure && isCrowdsecStreamHealthy {
-			isCrowdsecStreamHealthy = false
-			bouncer.log.Error(fmt.Sprintf("handleStreamTicker:error updateFailure:%d %s", updateFailure, err.Error()))
+		if errors.Is(err, cache.ErrRefreshBusy) {
+			bouncer.expireStreamHealth()
+			return
 		}
-		updateFailure++
+		failures := atomic.LoadInt64(&bouncer.updateFailures)
+		healthy := atomic.LoadInt32(&bouncer.streamHealthy) == 1
+		bouncer.log.Warn(fmt.Sprintf("handleStreamTicker updateFailure:%d isCrowdsecStreamHealthy:%t %s", failures, healthy, err.Error()))
+		if bouncer.updateMaxFailure != -1 && failures >= bouncer.updateMaxFailure && healthy {
+			atomic.StoreInt32(&bouncer.streamHealthy, 0)
+			bouncer.log.Error(fmt.Sprintf("handleStreamTicker:error updateFailure:%d %s", failures, err.Error()))
+		}
+		atomic.AddInt64(&bouncer.updateFailures, 1)
 	} else {
-		isCrowdsecStreamHealthy = true
-		updateFailure = 0
+		atomic.StoreInt64(&bouncer.streamLastSuccess, time.Now().UnixNano())
+		atomic.StoreInt32(&bouncer.streamHealthy, 1)
+		atomic.StoreInt64(&bouncer.updateFailures, 0)
 	}
+}
+
+// A busy owner is not a failure, but cannot keep stale followers healthy forever.
+func (bouncer *Bouncer) expireStreamHealth() {
+	if bouncer.updateMaxFailure == -1 {
+		return
+	}
+	lastSuccess := atomic.LoadInt64(&bouncer.streamLastSuccess)
+	limit := cache.RefreshLeaseDuration + time.Duration(bouncer.updateMaxFailure+1)*time.Duration(bouncer.updateInterval)*time.Second
+	if lastSuccess > 0 && time.Since(time.Unix(0, lastSuccess)) > limit {
+		atomic.StoreInt32(&bouncer.streamHealthy, 0)
+	}
+}
+
+func startContextTicker(ctx context.Context, interval int64, immediate bool, work func()) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Duration(interval) * time.Second)
+		defer ticker.Stop()
+		if immediate && ctx.Err() == nil {
+			work()
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if ctx.Err() == nil {
+					work()
+				}
+			}
+		}
+	}()
+	return done
 }
 
 func handleMetricsTicker(bouncer *Bouncer) {
@@ -631,7 +663,9 @@ func handleNoStreamCache(bouncer *Bouncer, remoteIP string) (string, error) {
 
 	if bytes.Equal(body, []byte("null")) {
 		if isLiveMode {
-			bouncer.cacheClient.Set(remoteIP, cache.NoBannedValue, bouncer.defaultDecisionTimeout)
+			if err = bouncer.cacheClient.Set(remoteIP, cache.NoBannedValue, bouncer.defaultDecisionTimeout); err != nil {
+				return cache.BannedValue, err
+			}
 		}
 		return cache.NoBannedValue, nil
 	}
@@ -643,7 +677,9 @@ func handleNoStreamCache(bouncer *Bouncer, remoteIP string) (string, error) {
 	}
 	if len(decisions) == 0 {
 		if isLiveMode {
-			bouncer.cacheClient.Set(remoteIP, cache.NoBannedValue, bouncer.defaultDecisionTimeout)
+			if err = bouncer.cacheClient.Set(remoteIP, cache.NoBannedValue, bouncer.defaultDecisionTimeout); err != nil {
+				return cache.BannedValue, err
+			}
 		}
 		return cache.NoBannedValue, nil
 	}
@@ -673,7 +709,9 @@ func handleNoStreamCache(bouncer *Bouncer, remoteIP string) (string, error) {
 		if bouncer.defaultDecisionTimeout < durationSecond {
 			durationSecond = bouncer.defaultDecisionTimeout
 		}
-		bouncer.cacheClient.Set(remoteIP, value, durationSecond)
+		if err = bouncer.cacheClient.Set(remoteIP, value, durationSecond); err != nil {
+			return cache.BannedValue, err
+		}
 	}
 	return value, errors.New("handleNoStreamCache:banned")
 }
@@ -710,62 +748,80 @@ func getToken(bouncer *Bouncer) error {
 	return fmt.Errorf("getToken statusCode:%d", login.Code)
 }
 
+func decodeStreamSnapshot(body []byte) (Stream, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return Stream{}, fmt.Errorf("handleStreamCache:parseBody %w", err)
+	}
+	if fields == nil {
+		return Stream{}, errors.New("handleStreamCache:expected snapshot object")
+	}
+	if _, ok := fields["new"]; !ok {
+		return Stream{}, errors.New("handleStreamCache:missing new field")
+	}
+	if _, ok := fields["deleted"]; !ok {
+		return Stream{}, errors.New("handleStreamCache:missing deleted field")
+	}
+	// Explicit null lists are valid empty lists in the CrowdSec API.
+	var stream Stream
+	if err := json.Unmarshal(body, &stream); err != nil {
+		return Stream{}, fmt.Errorf("handleStreamCache:parseBody %w", err)
+	}
+	return stream, nil
+}
+
 func handleStreamCache(bouncer *Bouncer) error {
-	// TODO clean properly on exit.
-	// Instead of blocking the goroutine interval for all the secondary node,
-	// if the master service is shut down, other goroutine can take the lead
-	// because updated routine information is in the cache
-	_, err := bouncer.cacheClient.Get(cacheTimeoutKey)
-	if err == nil {
-		bouncer.log.Debug("handleStreamCache:alreadyUpdated")
-		isCrowdsecStreamStartup = false
+	token, err := bouncer.cacheClient.BeginRefresh()
+	if err != nil {
+		return err
+	}
+	if token == "" {
+		atomic.StoreInt32(&bouncer.streamStartup, 0)
 		return nil
 	}
-	if err.Error() != cache.CacheMiss {
-		return err
-	}
-	// To avoid every instance trying to update the cache, set 1 second at least
-	leaseDuration := bouncer.updateInterval - 1
-	if leaseDuration < 1 {
-		leaseDuration = 1
-	}
-	bouncer.cacheClient.Set(cacheTimeoutKey, cache.NoBannedValue, leaseDuration)
-	streamRouteURL := url.URL{
-		Scheme:   bouncer.crowdsecScheme,
-		Host:     bouncer.crowdsecHost,
-		Path:     bouncer.crowdsecPath + bouncer.crowdsecStreamRoute,
-		RawQuery: fmt.Sprintf("startup=%t", !isCrowdsecStreamHealthy || isCrowdsecStreamStartup),
-	}
-	body, err := crowdsecQuery(bouncer, streamRouteURL.String(), nil)
-	if err != nil {
-		return err
-	}
-	var stream Stream
-	err = json.Unmarshal(body, &stream)
-	if err != nil {
-		return fmt.Errorf("handleStreamCache:parseBody %w", err)
-	}
-	for _, decision := range stream.Deleted {
-		bouncer.cacheClient.Delete(decision.Value)
-	}
-	for _, decision := range stream.New {
-		duration, err := time.ParseDuration(decision.Duration)
-		if err == nil {
-			var value string
-			switch decision.Type {
-			case "ban":
-				value = cache.BannedValue
-			case "captcha":
-				value = cache.CaptchaValue
-			default:
-				bouncer.log.Info("handleStreamCache:unknownType " + decision.Type)
-				value = cache.BannedValue
-			}
-			bouncer.cacheClient.Set(decision.Value, value, int64(duration.Seconds()))
+	defer func() {
+		if releaseErr := bouncer.cacheClient.EndRefresh(token); releaseErr != nil {
+			bouncer.log.Warn("handleStreamCache:release " + releaseErr.Error())
 		}
+	}()
+	markerTTL := bouncer.updateInterval - 1
+	if markerTTL < 1 {
+		markerTTL = 1
 	}
-	bouncer.log.Debug("handleStreamCache:updated")
-	isCrowdsecStreamStartup = false
+	streamURL := url.URL{Scheme: bouncer.crowdsecScheme, Host: bouncer.crowdsecHost,
+		Path: bouncer.crowdsecPath + bouncer.crowdsecStreamRoute, RawQuery: "startup=true"}
+	body, err := crowdsecQuery(bouncer, streamURL.String(), nil)
+	if err != nil {
+		return err
+	}
+	stream, err := decodeStreamSnapshot(body)
+	if err != nil {
+		return err
+	}
+	entries := make(map[string]cache.SnapshotEntry)
+	removed := make([]string, 0, len(stream.Deleted))
+	for _, decision := range stream.Deleted {
+		removed = append(removed, decision.Value)
+	}
+	now := time.Now()
+	for _, decision := range stream.New {
+		duration, parseErr := time.ParseDuration(decision.Duration)
+		if parseErr != nil {
+			return fmt.Errorf("handleStreamCache:duration %w", parseErr)
+		}
+		if duration <= 0 {
+			continue
+		}
+		value := cache.BannedValue
+		if decision.Type == "captcha" {
+			value = cache.CaptchaValue
+		}
+		entries[decision.Value] = cache.SnapshotEntry{Value: value, Until: now.Add(duration).UnixMilli()}
+	}
+	if err = bouncer.cacheClient.CommitRefresh(token, entries, removed, markerTTL); err != nil {
+		return err
+	}
+	atomic.StoreInt32(&bouncer.streamStartup, 0)
 	return nil
 }
 

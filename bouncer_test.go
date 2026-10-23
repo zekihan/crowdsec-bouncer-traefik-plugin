@@ -1079,12 +1079,16 @@ func TestServeHTTPServesAppsecCaptchaInAppsecMode(t *testing.T) {
 	}
 	cacheClient := &cache.Client{}
 	cacheClient.New(logger.New("INFO", ""), false, "", nil, "", "")
-	t.Cleanup(func() { cacheClient.Delete("192.0.2.30_captcha") })
+	t.Cleanup(func() {
+		if err := cacheClient.Delete("192.0.2.30_captcha"); err != nil {
+			t.Error(err)
+		}
+	})
 
 	for _, solved := range []bool{false, true} {
 		nextCalled = false
 		if solved {
-			cacheClient.Set("192.0.2.30_captcha", cache.CaptchaDoneValue, 60)
+			requireCacheSuccess(t, cacheClient.Set("192.0.2.30_captcha", cache.CaptchaDoneValue, 60))
 		}
 		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
 		req.RemoteAddr = "192.0.2.30:1234"
@@ -1168,5 +1172,12 @@ func TestHandleNextServeHTTPBodyReadErrorIsNotABan(t *testing.T) {
 				t.Errorf("expected no blocked request to be counted, got %d", got)
 			}
 		})
+	}
+}
+
+func requireCacheSuccess(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
 	}
 }

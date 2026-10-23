@@ -13,7 +13,7 @@ func Test_Get(t *testing.T) {
 	IPInCache := "10.0.0.10"
 	IPNotInCache := "10.0.0.20"
 	client := &Client{cache: &localCache{}, log: logger.New("INFO", "")}
-	client.Set(IPInCache, BannedValue, 10)
+	requireCacheSuccess(t, client.Set(IPInCache, BannedValue, 10))
 	type args struct {
 		clientIP string
 	}
@@ -69,7 +69,7 @@ func Test_Set(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client.Set(tt.args.clientIP, tt.args.value, tt.args.duration)
+			requireCacheSuccess(t, client.Set(tt.args.clientIP, tt.args.value, tt.args.duration))
 			got, err := client.Get(tt.args.clientIP)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Set() error = %v, wantErr %v", err, tt.wantErr)
@@ -90,7 +90,7 @@ func Test_Delete(t *testing.T) {
 	IPInCache := "10.0.0.12"
 	IPNotInCache := "10.0.0.22"
 	client := &Client{cache: &localCache{}, log: logger.New("INFO", "")}
-	client.Set(IPInCache, BannedValue, 10)
+	requireCacheSuccess(t, client.Set(IPInCache, BannedValue, 10))
 	type args struct {
 		clientIP string
 	}
@@ -107,7 +107,7 @@ func Test_Delete(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client.Delete(tt.args.clientIP)
+			requireCacheSuccess(t, client.Delete(tt.args.clientIP))
 			got, err := client.Get(tt.args.clientIP)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Delete() error = %v, wantErr %v", err, tt.wantErr)
@@ -158,5 +158,12 @@ func Test_nextReader(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func requireCacheSuccess(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
 	}
 }

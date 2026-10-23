@@ -19,6 +19,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -49,14 +50,41 @@ func list(m map[string]Decision) []Decision {
 	return out
 }
 
-// --- Redis mock (inline-command wire format, as spoken by simpleredis) ---
+// readRedisCommand accepts RESP arrays and the legacy inline format.
+func readRedisCommand(r *bufio.Reader) ([]string, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(line, "*") {
+		return strings.Fields(line), nil
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(line[1:]))
+	if err != nil || count < 1 || count > 16 {
+		return nil, io.ErrUnexpectedEOF
+	}
+	args := make([]string, count)
+	for i := range args {
+		line, err = r.ReadString('\n')
+		if err != nil || !strings.HasPrefix(line, "$") {
+			return nil, io.ErrUnexpectedEOF
+		}
+		size, err := strconv.Atoi(strings.TrimSpace(line[1:]))
+		if err != nil || size < 0 || size > 1048576 {
+			return nil, io.ErrUnexpectedEOF
+		}
+		data := make([]byte, size+2)
+		if _, err = io.ReadFull(r, data); err != nil {
+			return nil, err
+		}
+		if string(data[size:]) != "\r\n" {
+			return nil, io.ErrUnexpectedEOF
+		}
+		args[i] = string(data[:size])
+	}
+	return args, nil
+}
 
-// serveRedis is a hardcoded stand-in. When verdicts is true it plays a replica
-// that holds decisions: every line is scanned for known IPs, 1.2.3.4 → "f"
-// (clean), 1.2.3.5 → "t" (banned); any other GET is a miss ($-1). When verdicts
-// is false it plays the primary and answers every GET with a miss, so a
-// scenario can prove reads are served from the replica and not the primary.
-// SET, DEL, AUTH, SELECT get +OK (they don't read the response anyway).
 func serveRedis(addr string, verdicts bool) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -73,18 +101,24 @@ func serveRedis(addr string, verdicts bool) {
 			defer conn.Close()
 			rd := bufio.NewReader(conn)
 			for {
-				line, _, err := rd.ReadLine()
-				if err != nil {
+				args, err := readRedisCommand(rd)
+				if err != nil || len(args) == 0 {
 					return
 				}
-				s := string(line)
-				switch {
-				case verdicts && strings.Contains(s, "1.2.3.4"):
-					conn.Write([]byte("$1\r\nf\r\n"))
-				case verdicts && strings.Contains(s, "1.2.3.5"):
-					conn.Write([]byte("$1\r\nt\r\n"))
-				case strings.HasPrefix(strings.ToUpper(s), "GET "):
-					conn.Write([]byte("$-1\r\n"))
+				switch args[0] {
+				case "GET":
+					if len(args) != 2 {
+						return
+					}
+					if verdicts && strings.HasSuffix(args[1], "1.2.3.4") {
+						conn.Write([]byte("$1\r\nf\r\n"))
+					} else if verdicts && strings.HasSuffix(args[1], "1.2.3.5") {
+						conn.Write([]byte("$1\r\nt\r\n"))
+					} else {
+						conn.Write([]byte("$-1\r\n"))
+					}
+				case "DEL":
+					conn.Write([]byte(":1\r\n"))
 				default:
 					conn.Write([]byte("+OK\r\n"))
 				}

@@ -24,6 +24,7 @@ e2e_mock_%:
 
 vendor:
 	go mod vendor
+	git apply patches/simpleredis-acl.patch
 
 clean:
 	rm -rf ./vendor

@@ -454,6 +454,15 @@ make run
   - default: []
   - List of Redis replica hostnames (host:port) to use for read operations. Reads are distributed round-robin across replicas. Falls back to RedisCacheHost when empty.
   - Note: when set, reads are not retried against RedisCacheHost (the primary) if the replicas are unreachable. With RedisCacheUnreachableBlock at its default (true), a replica outage will therefore block/delay requests even though the primary is healthy.
+- RedisCacheUsername
+  - Default: `""`
+  - Redis ACL username. Empty keeps password-only AUTH. Applied to the primary and every reader.
+
+- RedisCacheKeyPrefix
+  - Default: `""`
+  - Exact prefix prepended to every decision, refresh marker, lease, snapshot index, and CAPTCHA key. Set a trailing separator, e.g. `crowdsec:`. Pair this with a Redis ACL key rule; a prefix alone does not enforce isolation.
+  - Stream refresh requires Redis 7+ and `+eval` alongside `+get +set +del +select`, restricted to that prefix. It uses full snapshots and an owner-checked lease; see [packaging and refresh requirements](packaging/README.md#coordinated-refresh-protocol).
+
 - RedisCachePassword
   - string
   - default: ""

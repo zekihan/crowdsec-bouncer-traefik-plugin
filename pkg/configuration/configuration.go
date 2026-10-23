@@ -94,6 +94,8 @@ type Config struct {
 	ForwardedHeadersCustomName                 string   `json:"forwardedHeadersCustomName,omitempty"`
 	ForwardedHeadersTrustedIPs                 []string `json:"forwardedHeadersTrustedIps,omitempty"`
 	ClientTrustedIPs                           []string `json:"clientTrustedIps,omitempty"`
+	RedisCacheUsername                         string   `json:"redisCacheUsername,omitempty"`
+	RedisCacheKeyPrefix                        string   `json:"redisCacheKeyPrefix,omitempty"`
 	RedisCacheEnabled                          bool     `json:"redisCacheEnabled,omitempty"`
 	RedisCacheHost                             string   `json:"redisCacheHost,omitempty"`
 	RedisCacheReadHosts                        []string `json:"redisCacheReadHosts,omitempty"`

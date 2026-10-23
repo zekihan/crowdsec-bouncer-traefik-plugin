@@ -212,15 +212,15 @@ start_stack() {
     "${mock_tls_args[@]}" >"$WORKDIR/mock.log" 2>&1 &
   MOCK_PID=$!
 
+  wait_for_status "${lapi_scheme}://127.0.0.1:${LAPI_PORT}/health" 200 30 "${lapi_curl[@]}"
+  wait_for_status "http://127.0.0.1:${APPSEC_PORT}/" 200 30
+
   # Opt-in trust store for the Traefik process: a scenario exports
   # TRAEFIK_SSL_CERT_FILE to point Go's x509.SystemCertPool() at a specific CA
   # bundle. Empty -> Go's default system store (unchanged behaviour).
   ( cd "$WORKDIR" && SSL_CERT_FILE="${TRAEFIK_SSL_CERT_FILE:-}" exec "$traefik_bin" --configfile=traefik.yml ) >"$WORKDIR/traefik.log" 2>&1 &
   TRAEFIK_PID=$!
 
-  wait_for_status "${lapi_scheme}://127.0.0.1:${LAPI_PORT}/health" 200 30 "${lapi_curl[@]}"
-  # AppSec stand-in: a bare GET carries no "rpc2" URI, so it answers 200 (allow).
-  wait_for_status "http://127.0.0.1:${APPSEC_PORT}/" 200 30
   # /ping is served by Traefik itself once it is up (plugin compilation included).
   wait_for_status "http://127.0.0.1:${WEB_PORT}/ping" 200 60
 }

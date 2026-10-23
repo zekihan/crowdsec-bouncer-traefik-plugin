@@ -33,6 +33,8 @@ var cache = ttl_map.New()
 type localCache struct{}
 
 func (localCache) get(key string) (string, error) {
+	refreshMemory.Lock()
+	defer refreshMemory.Unlock()
 	value, isCached := cache.Get(key)
 	valueString, isValid := value.(string)
 	if isCached && isValid && len(valueString) > 0 {
@@ -41,15 +43,22 @@ func (localCache) get(key string) (string, error) {
 	return "", errors.New(CacheMiss)
 }
 
-func (localCache) set(key, value string, duration int64) {
+func (localCache) set(key, value string, duration int64) error {
+	refreshMemory.Lock()
+	defer refreshMemory.Unlock()
 	cache.Set(key, value, duration)
+	return nil
 }
 
-func (localCache) delete(key string) {
+func (localCache) delete(key string) error {
+	refreshMemory.Lock()
+	defer refreshMemory.Unlock()
 	cache.Del(key)
+	return nil
 }
 
 type redisCache struct {
+	prefix  string
 	log     *slog.Logger
 	writer  simpleredis.SimpleRedis
 	readers []simpleredis.SimpleRedis
@@ -66,7 +75,7 @@ func (rc *redisCache) nextReader() *simpleredis.SimpleRedis {
 }
 
 func (rc *redisCache) get(key string) (string, error) {
-	value, err := rc.nextReader().Get(key)
+	value, err := rc.nextReader().Get(rc.prefix + key)
 	if err != nil {
 		switch err.Error() {
 		case simpleredis.RedisMiss:
@@ -84,22 +93,18 @@ func (rc *redisCache) get(key string) (string, error) {
 	return "", errors.New(CacheMiss)
 }
 
-func (rc *redisCache) set(key, value string, duration int64) {
-	if err := rc.writer.Set(key, []byte(value), duration); err != nil {
-		rc.log.Error("cache:setDecisionRedisCache" + err.Error())
-	}
+func (rc *redisCache) set(key, value string, duration int64) error {
+	return rc.writer.Set(rc.prefix+key, []byte(value), duration)
 }
 
-func (rc *redisCache) delete(key string) {
-	if err := rc.writer.Del(key); err != nil {
-		rc.log.Error("cache:deleteDecisionRedisCache " + err.Error())
-	}
+func (rc *redisCache) delete(key string) error {
+	return rc.writer.Del(rc.prefix + key)
 }
 
 type cacheInterface interface {
-	set(key, value string, duration int64)
+	set(key, value string, duration int64) error
 	get(key string) (string, error)
-	delete(key string)
+	delete(key string) error
 }
 
 // Client Cache client.
@@ -110,13 +115,18 @@ type Client struct {
 
 // New Initialize cache client.
 func (c *Client) New(log *slog.Logger, isRedis bool, writeHost string, readHosts []string, pass, database string) {
+	c.NewWithACL(log, isRedis, writeHost, readHosts, "", pass, database, "")
+}
+
+// NewWithACL configures an isolated Redis identity and key namespace.
+func (c *Client) NewWithACL(log *slog.Logger, isRedis bool, writeHost string, readHosts []string, username, pass, database, prefix string) {
 	c.log = log
 	if isRedis {
-		rc := &redisCache{log: log}
-		rc.writer.Init(writeHost, pass, database)
+		rc := &redisCache{log: log, prefix: prefix}
+		rc.writer.InitWithUsername(writeHost, username, pass, database)
 		for _, h := range readHosts {
 			var r simpleredis.SimpleRedis
-			r.Init(h, pass, database)
+			r.InitWithUsername(h, username, pass, database)
 			rc.readers = append(rc.readers, r)
 		}
 		c.cache = rc
@@ -127,9 +137,9 @@ func (c *Client) New(log *slog.Logger, isRedis bool, writeHost string, readHosts
 }
 
 // Delete delete decision in cache.
-func (c *Client) Delete(key string) {
+func (c *Client) Delete(key string) error {
 	c.log.Debug(fmt.Sprintf("cache:Delete key:%v", key))
-	c.cache.delete(key)
+	return c.cache.delete(key)
 }
 
 // Get check in the cache if the IP has the banned / not banned value.
@@ -140,7 +150,7 @@ func (c *Client) Get(key string) (string, error) {
 }
 
 // Set update the cache with the IP as key and the value banned / not banned.
-func (c *Client) Set(key string, value string, duration int64) {
+func (c *Client) Set(key string, value string, duration int64) error {
 	c.log.Debug(fmt.Sprintf("cache:Set key:%v value:%v duration:%vs", key, value, duration))
-	c.cache.set(key, value, duration)
+	return c.cache.set(key, value, duration)
 }

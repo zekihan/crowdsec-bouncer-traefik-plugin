@@ -95,7 +95,11 @@ func (c *Client) ServeHTTP(rw http.ResponseWriter, r *http.Request, remoteIP str
 	}
 	if valid {
 		c.log.Debug("captcha:ServeHTTP captcha:valid")
-		c.cacheClient.Set(remoteIP+"_captcha", cache.CaptchaDoneValue, c.gracePeriodSeconds)
+		if err = c.cacheClient.Set(remoteIP+"_captcha", cache.CaptchaDoneValue, c.gracePeriodSeconds); err != nil {
+			c.log.Error("captcha:cache write failed")
+			rw.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		if c.remediationCustomHeader != "" {
 			rw.Header().Set(c.remediationCustomHeader, "solved-captcha")
 		}

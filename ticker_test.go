@@ -1,6 +1,7 @@
 package crowdsec_bouncer_traefik_plugin //nolint:revive,stylecheck
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -33,5 +34,27 @@ func Test_runTicker_keepsEachTickerOnItsOwnChannel(t *testing.T) {
 	runs.Wait()
 	if streamRuns != count || metricsRuns != count {
 		t.Errorf("runTicker ran stream %d and metrics %d times, want %d each", streamRuns, metricsRuns, count)
+	}
+}
+
+func TestContextTickerStopsAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := startContextTicker(ctx, 1, true, func() {
+		close(started)
+		<-release
+	})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("initial refresh did not start")
+	}
+	cancel()
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("retired middleware retained its refresh loop")
 	}
 }
