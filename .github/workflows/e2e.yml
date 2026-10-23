@@ -31,6 +31,8 @@ jobs:
       # Docker suite (tests/e2e/scenarios) stays available for local debugging.
       # `-k` keeps going after a failing scenario so the logs cover all of
       # them, while make still exits non-zero if any scenario failed.
+      - name: Install disposable Redis fixture dependencies
+        run: sudo apt-get update && sudo apt-get install -y redis-server redis-tools
       - name: Run mock scenarios
         run: make -k e2e_mock
       - name: Upload logs on failure

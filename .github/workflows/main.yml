@@ -68,7 +68,7 @@ jobs:
           git diff --exit-code go.mod
           # git diff --exit-code go.sum
           go mod download
-          go mod vendor
+          make vendor
           # git diff --exit-code ./vendor/
 
       - name: Lint and Tests
