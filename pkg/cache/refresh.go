@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/maxlerebourg/simpleredis"
 )
 
 // RefreshLeaseDuration bounds an in-flight snapshot refresh.
@@ -83,6 +85,29 @@ var refreshMemory = struct {
 	until    time.Time
 	previous map[string]SnapshotEntry
 }{previous: make(map[string]SnapshotEntry)}
+
+// HasFreshSnapshot checks only the committed success marker, using the writer.
+func (c *Client) HasFreshSnapshot() (bool, error) {
+	if rc, ok := c.cache.(*redisCache); ok {
+		value, err := rc.writer.Get(rc.prefix + "updated")
+		return validSnapshotMarker(string(value), err, simpleredis.RedisMiss)
+	}
+	value, err := c.cache.get("updated")
+	return validSnapshotMarker(value, err, CacheMiss)
+}
+
+func validSnapshotMarker(value string, err error, miss string) (bool, error) {
+	if err != nil {
+		if err.Error() == miss {
+			return false, nil
+		}
+		return false, err
+	}
+	if value != NoBannedValue {
+		return false, errors.New("cache:invalid snapshot marker")
+	}
+	return true, nil
+}
 
 // BeginRefresh returns an owner token, or an empty token if already refreshed.
 // A busy lease is an error, not evidence of a successfully populated cache.

@@ -401,7 +401,7 @@ func (bouncer *Bouncer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// Right here if we cannot join the stream we forbid the request to go on.
 	if bouncer.crowdsecMode == configuration.StreamMode || bouncer.crowdsecMode == configuration.AloneMode {
-		if atomic.LoadInt32(&bouncer.streamHealthy) == 1 {
+		if atomic.LoadInt32(&bouncer.streamHealthy) == 1 || bouncer.adoptSharedSnapshot() {
 			bouncer.handleNextServeHTTP(rw, req, remoteIP)
 		} else {
 			bouncer.log.Debug(fmt.Sprintf("ServeHTTP isCrowdsecStreamHealthy:false ip:%s updateFailure:%d", remoteIP, atomic.LoadInt64(&bouncer.updateFailures)))
@@ -568,6 +568,20 @@ func (bouncer *Bouncer) handleAppsecResponseServeHTTP(rw http.ResponseWriter, re
 	if _, err := rw.Write([]byte(decision.UserBodyContent)); err != nil {
 		bouncer.log.Warn("handleAppsecResponseServeHTTP could not write appsec response: " + err.Error())
 	}
+}
+
+// A cold follower can miss every success marker when refresh timers align.
+// Adopt a committed snapshot on an uncached request instead of waiting one poll.
+func (bouncer *Bouncer) adoptSharedSnapshot() bool {
+	fresh, err := bouncer.cacheClient.HasFreshSnapshot()
+	if err != nil || !fresh {
+		return false
+	}
+	atomic.StoreInt32(&bouncer.streamStartup, 0)
+	atomic.StoreInt64(&bouncer.streamLastSuccess, time.Now().UnixNano())
+	atomic.StoreInt32(&bouncer.streamHealthy, 1)
+	atomic.StoreInt64(&bouncer.updateFailures, 0)
+	return true
 }
 
 func handleStreamTicker(bouncer *Bouncer) {

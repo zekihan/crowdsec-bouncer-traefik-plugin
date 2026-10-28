@@ -62,6 +62,9 @@ def redis_command(port, *args):
 
 class Suite:
     def __init__(self, output):
+        self.artifact = os.environ.get(
+            "CROWDSEC_TEST_ARTIFACT", "local/crowdsec-plugin:redis-acl"
+        )
         self.output = Path(output).resolve()
         self.output.mkdir(parents=True, exist_ok=True)
         self.events = open(self.output / "events.jsonl", "a", buffering=1)
@@ -227,7 +230,7 @@ class Suite:
             "0.1",
             "-v",
             volume + ":/destination",
-            "local/crowdsec-plugin:redis-acl",
+            self.artifact,
         )
         self.volume = volume
         archive = subprocess.check_output(
@@ -244,7 +247,7 @@ class Suite:
                 "docker",
                 "image",
                 "inspect",
-                "local/crowdsec-plugin:redis-acl",
+                self.artifact,
                 "--format",
                 "{{json .Descriptor}}",
             ),
@@ -293,7 +296,9 @@ class Suite:
         stream = dict(
             plugin,
             crowdsecMode="stream",
-            updateIntervalSeconds=1 if mode == "stream" else 10,
+            updateIntervalSeconds=getattr(self, "overrides", {}).get(
+                "updateIntervalSeconds", 1 if mode == "stream" else 10
+            ),
         )
         dynamic = {
             "http": {
@@ -322,6 +327,7 @@ class Suite:
                 },
             }
         }
+        dynamic["http"]["routers"].update(getattr(self, "extra_routers", {}))
         path = self.temp / "dynamic.yaml"
         pending = self.temp / "dynamic.new"
         pending.write_text(json.dumps(dynamic))
@@ -353,6 +359,7 @@ class Suite:
                 "localPlugins": {"bouncer": {"moduleName": MODULE}},
             },
         )
+        static.update(getattr(self, "static_overrides", {}))
         (self.temp / "traefik.json").write_text(json.dumps(static))
         source = (
             f"type=bind,src={self.temp / 'upstream'},dst=/plugins-local/src/{MODULE},readonly"
@@ -383,6 +390,7 @@ class Suite:
                 "127.0.0.1::8000",
                 "-p",
                 "127.0.0.1::8080",
+                *getattr(self, "extra_ports", ()),
             ),
         )
         self.port, self.diag = (

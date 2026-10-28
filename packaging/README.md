@@ -98,3 +98,24 @@ success marker restores health; `updateMaxFailure: -1` keeps explicit fail-open.
 enabled remains unhealthy until a successful refresh or success marker is
 observed. Explicit startup fail-open behavior is preserved. Unknown lease replies
 are errors, not contention.
+
+## Cold stream follower regression
+
+`tests/acceptance/follower_startup.py` holds a synthetic refresh owner across
+Traefik startup with a 300-second update interval. It verifies that cold requests
+and readiness fail closed, then recover immediately after the owner publishes a
+committed marker. IPv4/IPv6 bans remain enforced and recovery makes no extra
+LAPI poll. Native ping stays healthy while the middleware is blocked.
+
+Set `CROWDSEC_TEST_ARTIFACT` to test an unpublished image without replacing the
+existing `local/crowdsec-plugin:redis-acl` tag. The default is unchanged. Fixtures
+use isolated Docker networks, volumes, loopback ports and dummy credentials.
+They do not use Kubernetes, real identities or live Redis.
+
+```sh
+CROWDSEC_TEST_ARTIFACT=local/crowdsec-plugin:repo2-follower-fix \
+  python3 tests/acceptance/follower_startup.py --output logs/follower-startup
+```
+
+This functional regression does not qualify production capacity or replace the
+separately required artifact promotion and rollout acceptance gates.
