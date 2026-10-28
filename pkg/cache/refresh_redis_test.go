@@ -38,6 +38,9 @@ func TestRedisRefreshRegression(t *testing.T) {
 		}
 		entries := map[string]SnapshotEntry{"192.0.2.41": {Value: BannedValue, Until: time.Now().Add(time.Minute).UnixMilli()}}
 		requireCacheSuccess(t, a.CommitRefresh(token, entries, []string{}, 1))
+		if fresh, markerErr := b.HasFreshSnapshot(); markerErr != nil || !fresh {
+			t.Fatal("snapshot marker used stale decision reader", markerErr)
+		}
 		if token, err = b.BeginRefresh(); err != nil || token != "" {
 			t.Fatal("coordination used stale reader", token, err)
 		}

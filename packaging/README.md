@@ -25,11 +25,13 @@ The `make vendor` target reapplies `patches/simpleredis-acl.patch`. Plain
 `go mod vendor` would discard the local client fix. The client uses a 1.9-second
 internal deadline to satisfy the two-second end-to-end operation budget.
 
-The GitOps branch references the built OCI index digest at the **proposed**
-`ghcr.io/zekihan/crowdsec-traefik-local-plugin` location. Nothing has been pushed.
-That reference cannot be pulled from a registry until a separately approved
-publication preserves that exact digest. Rebuilding with a new revision label
-changes the digest: revalidate that artifact and update the GitOps pin.
+GitOps uses a tagless OCI index digest from the published
+`docker.io/zekihan/crowdsec-traefik-local-plugin` repository. The Argo acceptance
+record identifies each artifact's source revision, source manifest, registry
+digest and validation results. Preserve the original `redis-acl` tag when
+publishing a replacement. A new digest cannot be pulled until its publication
+is verified. Rebuilding with a new revision label changes the digest: revalidate
+that artifact and update the GitOps pin.
 
 ## isolated acceptance
 
@@ -82,9 +84,10 @@ with the decision keys; removing it independently loses reconciliation history.
 
 Full snapshots increase API traffic and script work. The local regression tests
 do not qualify performance for large decision sets. A fetch exceeding the lease
-is rejected; subsequent refreshes retry. No long performance tests were run for
-this revision. Legacy unindexed keys expire normally unless explicitly deleted
-by the API. Start with the planned cold, prefixed namespace at ACL cutover.
+is rejected; subsequent refreshes retry. Record the full comparison and soak
+outcomes for each replacement. Legacy unindexed keys expire normally unless
+explicitly deleted by the API. Start with the planned cold, prefixed namespace
+at ACL cutover.
 
 Snapshot validation requires an object with both `new` and `deleted` lists.
 Explicit null lists are valid empty lists; null top-level bodies, missing fields
@@ -98,3 +101,34 @@ success marker restores health; `updateMaxFailure: -1` keeps explicit fail-open.
 enabled remains unhealthy until a successful refresh or success marker is
 observed. Explicit startup fail-open behavior is preserved. Unknown lease replies
 are errors, not contention.
+
+## Cold stream follower regression
+
+`tests/acceptance/follower_startup.py` holds a synthetic refresh owner across
+Traefik startup with a 300-second update interval. It verifies that cold requests
+and readiness fail closed, then recover immediately after the owner publishes a
+committed marker. IPv4/IPv6 bans remain enforced and recovery makes no extra
+LAPI poll. Native ping stays healthy while the middleware is blocked.
+
+Set `CROWDSEC_TEST_ARTIFACT` to test an unpublished image without replacing the
+existing `local/crowdsec-plugin:redis-acl` tag. The default is unchanged. Fixtures
+use isolated Docker networks, volumes, loopback ports and dummy credentials.
+They do not use Kubernetes, real identities or live Redis.
+
+```sh
+CROWDSEC_TEST_ARTIFACT=local/crowdsec-plugin:repo2-follower-fix \
+  python3 tests/acceptance/follower_startup.py --output logs/follower-startup
+```
+
+This functional regression does not qualify production capacity or replace the
+separately required artifact promotion and rollout acceptance gates.
+
+The fault soak classifies requests by their actual execution interval, including
+requests already in flight when an outage begins. Its outage/recovery window is
+unchanged; new requests after the recovery deadline must succeed. Banned clients,
+transport errors and the three-second request budget retain their checks. Run the
+synthetic boundary regressions without Docker:
+
+```sh
+python3 -m unittest discover -s tests/acceptance -p test_load.py
+```

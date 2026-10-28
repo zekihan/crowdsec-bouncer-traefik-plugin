@@ -14,6 +14,16 @@ def percentile(values, fraction):
     return sorted(values)[math.ceil(len(values) * fraction) - 1]
 
 
+def expected_response(code, duration, expected, started, finished, faults):
+    if duration > 3:
+        return False
+    if code == expected:
+        return True
+    # Requests already in flight can encounter the next scheduled outage.
+    fault_exposure = finished >= math.floor(started / 60) * 60 + 50
+    return faults and expected == 200 and code == 403 and fault_exposure
+
+
 def drive(suite, seconds, label, faults=False):
     start = time.monotonic()
     offset = getattr(suite, "corpus_offset", 0)
@@ -30,7 +40,7 @@ def drive(suite, seconds, label, faults=False):
     count = 0
     maximum = 0
 
-    def work(index, fault_phase):
+    def work(index):
         nonlocal maximum
         category = index % 10
         ip = (
@@ -43,13 +53,14 @@ def drive(suite, seconds, label, faults=False):
             )
         )
         expected = 403 if category in (7, 8) else 200
+        request_started = time.monotonic() - start
         code, duration, _ = suite.request(ip)
+        request_finished = time.monotonic() - start
         with lock:
             durations.append(duration)
             maximum = max(maximum, duration)
-            if duration > 3 or (
-                code != expected
-                and not (fault_phase and expected == 200 and code in (200, 403))
+            if not expected_response(
+                code, duration, expected, request_started, request_finished, faults
             ):
                 unexpected.append(
                     {
@@ -57,6 +68,8 @@ def drive(suite, seconds, label, faults=False):
                         "code": code,
                         "duration": duration,
                         "expected": expected,
+                        "started": request_started,
+                        "finished": request_finished,
                     }
                 )
         outstanding.release()
@@ -89,7 +102,7 @@ def drive(suite, seconds, label, faults=False):
             elif now - target > 0.1:
                 missed += 1
             if outstanding.acquire(blocking=False):
-                pool.submit(work, count, faults and phase >= 50)
+                pool.submit(work, count)
             else:
                 missed += 1
             count += 1
