@@ -707,38 +707,35 @@ func handleNoStreamCache(bouncer *Bouncer, remoteIP string) (string, error) {
 		return cache.BannedValue, err
 	}
 
-	if bytes.Equal(body, []byte("null")) {
-		if isLiveMode {
-			if err = bouncer.cacheClient.Set(remoteIP, cache.NoBannedValue, bouncer.defaultDecisionTimeout); err != nil {
-				return cache.BannedValue, err
-			}
-		}
-		return cache.NoBannedValue, nil
-	}
-
 	var decisions []Decision
 	err = json.Unmarshal(body, &decisions)
 	if err != nil {
 		return cache.BannedValue, fmt.Errorf("handleNoStreamCache:parseBody %w", err)
 	}
-	if len(decisions) == 0 {
+	var decision Decision
+	var duration time.Duration
+	for _, d := range decisions {
+		remaining, parseErr := time.ParseDuration(d.Duration)
+		if parseErr != nil {
+			return cache.BannedValue, fmt.Errorf("handleNoStreamCache:parseDuration %w", parseErr)
+		}
+		// Expired decisions must neither win remediation selection nor enter the cache.
+		if remaining <= 0 {
+			continue
+		}
+		decision = d
+		duration = remaining
+		if decision.Type == "ban" {
+			break
+		}
+	}
+	if duration == 0 {
 		if isLiveMode {
 			if err = bouncer.cacheClient.Set(remoteIP, cache.NoBannedValue, bouncer.defaultDecisionTimeout); err != nil {
 				return cache.BannedValue, err
 			}
 		}
 		return cache.NoBannedValue, nil
-	}
-	var decision Decision
-	for _, d := range decisions {
-		decision = d
-		if decision.Type == "ban" {
-			break
-		}
-	}
-	duration, err := time.ParseDuration(decision.Duration)
-	if err != nil {
-		return cache.BannedValue, fmt.Errorf("handleNoStreamCache:parseDuration %w", err)
 	}
 	var value string
 	switch decision.Type {
