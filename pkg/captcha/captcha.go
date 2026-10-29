@@ -147,7 +147,12 @@ func (c *Client) Validate(r *http.Request) (bool, error) {
 	var body = url.Values{}
 	body.Add("secret", c.secretKey)
 	body.Add("response", response)
-	res, err := c.httpClient.PostForm(c.infoProvider.validate, body)
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, c.infoProvider.validate, strings.NewReader(body.Encode()))
+	if err != nil {
+		return false, err
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	res, err := c.httpClient.Do(request)
 	if err != nil {
 		return false, err
 	}
