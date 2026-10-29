@@ -70,6 +70,7 @@ class Suite:
         self.events = open(self.output / "events.jsonl", "a", buffering=1)
         self.name = "redis-acl-" + uuid.uuid4().hex[:10]
         self.temp = Path(tempfile.mkdtemp(prefix="redis-acl-acceptance-"))
+        self.temp.chmod(0o755)  # Containers run as non-root and must traverse the fixture mount.
         self.containers = []
         self.volumes = []
         self.port = self.diag = 0
@@ -249,7 +250,7 @@ class Suite:
                 "inspect",
                 self.artifact,
                 "--format",
-                "{{json .Descriptor}}",
+                "{{json .Id}}",
             ),
         )
 
