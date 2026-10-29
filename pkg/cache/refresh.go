@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -162,6 +163,14 @@ func (c *Client) EndRefresh(token string) error {
 
 // CommitRefresh reconciles a complete startup=true snapshot and publishes success last.
 func (c *Client) CommitRefresh(token string, entries map[string]SnapshotEntry, removed []string, markerTTL int64) error {
+	return c.CommitRefreshContext(context.Background(), token, entries, removed, markerTTL)
+}
+
+// CommitRefreshContext rejects publication once cancellation has been observed.
+func (c *Client) CommitRefreshContext(ctx context.Context, token string, entries map[string]SnapshotEntry, removed []string, markerTTL int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for name := range entries {
 		if name == "updated" || name == "refresh:lease" || name == "refresh:snapshot" {
 			return errors.New("cache:reserved decision key")
@@ -173,11 +182,14 @@ func (c *Client) CommitRefresh(token string, entries map[string]SnapshotEntry, r
 		}
 	}
 	if rc, ok := c.cache.(*redisCache); ok {
-		return rc.commit(token, entries, removed, markerTTL)
+		return rc.commit(ctx, token, entries, removed, markerTTL)
 	}
 
 	refreshMemory.Lock()
 	defer refreshMemory.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if refreshMemory.token != token || !time.Now().Before(refreshMemory.until) {
 		return errors.New("cache:refresh lease lost")
 	}
@@ -205,7 +217,7 @@ func (c *Client) CommitRefresh(token string, entries map[string]SnapshotEntry, r
 	return nil
 }
 
-func (rc *redisCache) commit(token string, entries map[string]SnapshotEntry, removed []string, markerTTL int64) error {
+func (rc *redisCache) commit(ctx context.Context, token string, entries map[string]SnapshotEntry, removed []string, markerTTL int64) error {
 	data, err := json.Marshal(entries)
 	if err != nil {
 		return err
@@ -215,6 +227,9 @@ func (rc *redisCache) commit(token string, entries map[string]SnapshotEntry, rem
 	}
 	deleted, err := json.Marshal(removed)
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	result, err := rc.writer.Eval(commitRefresh, []string{rc.prefix + "refresh:lease", rc.prefix + "updated", rc.prefix + "refresh:snapshot"}, token, string(data), string(deleted), strconv.FormatInt(markerTTL, 10), rc.prefix)

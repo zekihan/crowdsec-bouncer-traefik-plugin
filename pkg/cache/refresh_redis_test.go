@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"os"
 	"testing"
 	"time"
@@ -68,6 +69,15 @@ func TestRedisRefreshRegression(t *testing.T) {
 		requireCacheSuccess(t, a.EndRefresh(expired))
 		if value, getErr := admin.Get(prefix + "refresh:lease"); getErr != nil || string(value) != "successor" {
 			t.Fatal("expired owner released successor", getErr)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err = a.CommitRefreshContext(ctx, expired, entries, nil, 1); err == nil {
+			t.Fatal("canceled refresh committed")
+		}
+		requireCacheSuccess(t, a.EndRefresh(expired))
+		if value, getErr := admin.Get(prefix + "refresh:lease"); getErr != nil || string(value) != "successor" {
+			t.Fatal("canceled owner released successor", getErr)
 		}
 		requireCacheSuccess(t, admin.Del(prefix+"refresh:lease"))
 	}

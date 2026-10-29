@@ -38,7 +38,7 @@ def regressions(s):
     env = dict(
         os.environ,
         REDIS_REFRESH_FIXTURE=f"127.0.0.1:{s.redis_port}",
-        GOCACHE="/private/tmp/redis-acl-go-cache",
+        GOCACHE=str(s.temp / "go-cache"),
     )
     result = command(
         "go",

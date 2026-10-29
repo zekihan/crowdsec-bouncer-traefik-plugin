@@ -317,10 +317,10 @@ func New(ctx context.Context, next http.Handler, config *configuration.Config, n
 		}
 		if config.StreamStartupBlock {
 			atomic.StoreInt32(&bouncer.streamHealthy, 0)
-			handleStreamTicker(bouncer)
+			handleStreamTickerContext(ctx, bouncer)
 		}
 		startContextTicker(ctx, config.UpdateIntervalSeconds, !config.StreamStartupBlock, func() {
-			handleStreamTicker(bouncer)
+			handleStreamTickerContext(ctx, bouncer)
 		})
 	}
 
@@ -585,7 +585,14 @@ func (bouncer *Bouncer) adoptSharedSnapshot() bool {
 }
 
 func handleStreamTicker(bouncer *Bouncer) {
-	if err := handleStreamCache(bouncer); err != nil {
+	handleStreamTickerContext(context.Background(), bouncer)
+}
+
+func handleStreamTickerContext(ctx context.Context, bouncer *Bouncer) {
+	if err := handleStreamCacheContext(ctx, bouncer); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		if errors.Is(err, cache.ErrRefreshBusy) {
 			bouncer.expireStreamHealth()
 			return
@@ -785,6 +792,13 @@ func decodeStreamSnapshot(body []byte) (Stream, error) {
 }
 
 func handleStreamCache(bouncer *Bouncer) error {
+	return handleStreamCacheContext(context.Background(), bouncer)
+}
+
+func handleStreamCacheContext(ctx context.Context, bouncer *Bouncer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	token, err := bouncer.cacheClient.BeginRefresh()
 	if err != nil {
 		return err
@@ -804,7 +818,7 @@ func handleStreamCache(bouncer *Bouncer) error {
 	}
 	streamURL := url.URL{Scheme: bouncer.crowdsecScheme, Host: bouncer.crowdsecHost,
 		Path: bouncer.crowdsecPath + bouncer.crowdsecStreamRoute, RawQuery: "startup=true"}
-	body, err := crowdsecQuery(bouncer, streamURL.String(), nil)
+	body, err := crowdsecQueryContext(ctx, bouncer, streamURL.String(), nil)
 	if err != nil {
 		return err
 	}
@@ -832,7 +846,7 @@ func handleStreamCache(bouncer *Bouncer) error {
 		}
 		entries[decision.Value] = cache.SnapshotEntry{Value: value, Until: now.Add(duration).UnixMilli()}
 	}
-	if err = bouncer.cacheClient.CommitRefresh(token, entries, removed, markerTTL); err != nil {
+	if err = bouncer.cacheClient.CommitRefreshContext(ctx, token, entries, removed, markerTTL); err != nil {
 		return err
 	}
 	atomic.StoreInt32(&bouncer.streamStartup, 0)
@@ -846,12 +860,17 @@ func isReverseProxyError(statusCode int) bool {
 }
 
 func crowdsecQuery(bouncer *Bouncer, stringURL string, data []byte) ([]byte, error) {
+	return crowdsecQueryContext(context.Background(), bouncer, stringURL, data)
+}
+
+func crowdsecQueryContext(ctx context.Context, bouncer *Bouncer, stringURL string, data []byte) ([]byte, error) {
 	var req *http.Request
 	if len(data) > 0 {
 		req, _ = http.NewRequest(http.MethodPost, stringURL, bytes.NewBuffer(data))
 	} else {
 		req, _ = http.NewRequest(http.MethodGet, stringURL, nil)
 	}
+	req = req.WithContext(ctx)
 	req.Header.Set(bouncer.crowdsecHeader, bouncer.crowdsecKey)
 	req.Header.Set("User-Agent", "Crowdsec-Bouncer-Traefik-Plugin/"+pluginVersion)
 
@@ -868,7 +887,7 @@ func crowdsecQuery(bouncer *Bouncer, stringURL string, data []byte) ([]byte, err
 		if errToken := getToken(bouncer); errToken != nil {
 			return nil, fmt.Errorf("crowdsecQuery:renewToken url:%s %w", stringURL, errToken)
 		}
-		return crowdsecQuery(bouncer, stringURL, nil)
+		return crowdsecQueryContext(ctx, bouncer, stringURL, nil)
 	}
 
 	// Check if the status code starts with 2
