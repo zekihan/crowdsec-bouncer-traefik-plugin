@@ -870,7 +870,12 @@ func handleStreamCacheContext(ctx context.Context, bouncer *Bouncer) error {
 		if previous, ok := entries[decision.Value]; ok && previous.Value == cache.BannedValue && value == cache.CaptchaValue {
 			continue
 		}
-		entries[decision.Value] = cache.SnapshotEntry{Value: value, Until: now.Add(duration).UnixMilli()}
+		until := now.Add(duration).UnixMilli()
+		// Duplicate remediations remain active until the longest decision expires.
+		if previous, ok := entries[decision.Value]; ok && previous.Value == value && previous.Until >= until {
+			continue
+		}
+		entries[decision.Value] = cache.SnapshotEntry{Value: value, Until: until}
 	}
 	if err = bouncer.cacheClient.CommitRefreshContext(ctx, token, entries, removed, markerTTL); err != nil {
 		return err
