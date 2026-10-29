@@ -869,6 +869,10 @@ func handleStreamCacheContext(ctx context.Context, bouncer *Bouncer) error {
 		if decision.Type == "captcha" {
 			value = cache.CaptchaValue
 		}
+		// A solved CAPTCHA must not bypass a simultaneous ban for the same IP.
+		if previous, ok := entries[decision.Value]; ok && previous.Value == cache.BannedValue && value == cache.CaptchaValue {
+			continue
+		}
 		entries[decision.Value] = cache.SnapshotEntry{Value: value, Until: now.Add(duration).UnixMilli()}
 	}
 	if err = bouncer.cacheClient.CommitRefreshContext(ctx, token, entries, removed, markerTTL); err != nil {
