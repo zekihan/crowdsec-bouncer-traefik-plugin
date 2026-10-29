@@ -280,6 +280,29 @@ func New(ctx context.Context, next http.Handler, config *configuration.Config, n
 		config.RedisCacheDatabase,
 		config.RedisCacheKeyPrefix,
 	)
+	if config.RedisCachePoolMaxActive != 0 {
+		if poolErr := bouncer.cacheClient.ConfigurePool(config.RedisCachePoolMaxActive, config.RedisCachePoolMaxIdle, config.RedisCachePoolMaxWaiters, config.RedisCachePoolIdleTimeoutSeconds, config.RedisCachePoolMaxLifetimeSeconds); poolErr != nil {
+			return nil, poolErr
+		}
+	}
+	initialized := false
+	var refreshDone <-chan struct{}
+	defer func() {
+		if !initialized {
+			bouncer.cacheClient.Close()
+			return
+		}
+		if config.RedisCachePoolMaxActive > 0 && ctx.Done() != nil {
+			go func() {
+				<-ctx.Done()
+				// The retiring refresh must release its fenced lease before Redis is closed.
+				if refreshDone != nil {
+					<-refreshDone
+				}
+				bouncer.cacheClient.Close()
+			}()
+		}
+	}()
 	config.CaptchaSiteKey, _ = configuration.GetVariable(config, "CaptchaSiteKey")
 	config.CaptchaSecretKey, _ = configuration.GetVariable(config, "CaptchaSecretKey")
 	err = bouncer.captchaClient.New(
@@ -305,6 +328,7 @@ func New(ctx context.Context, next http.Handler, config *configuration.Config, n
 		return nil, err
 	}
 	if config.CrowdsecMode == configuration.AppsecMode {
+		initialized = true
 		return bouncer, nil
 	}
 
@@ -319,7 +343,7 @@ func New(ctx context.Context, next http.Handler, config *configuration.Config, n
 			atomic.StoreInt32(&bouncer.streamHealthy, 0)
 			handleStreamTickerContext(ctx, bouncer)
 		}
-		startContextTicker(ctx, config.UpdateIntervalSeconds, !config.StreamStartupBlock, func() {
+		refreshDone = startContextTicker(ctx, config.UpdateIntervalSeconds, !config.StreamStartupBlock, func() {
 			handleStreamTickerContext(ctx, bouncer)
 		})
 	}
@@ -335,6 +359,7 @@ func New(ctx context.Context, next http.Handler, config *configuration.Config, n
 
 	bouncer.log.Debug("New initialized mode:" + config.CrowdsecMode)
 
+	initialized = true
 	return bouncer, nil
 }
 
@@ -374,7 +399,7 @@ func (bouncer *Bouncer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// TODO This should be simplified
 	if bouncer.crowdsecMode != configuration.NoneMode {
-		value, cacheErr := bouncer.cacheClient.Get(remoteIP)
+		value, cacheErr := bouncer.cacheClient.GetContext(req.Context(), remoteIP)
 		if cacheErr != nil {
 			cacheErrString := cacheErr.Error()
 			bouncer.log.Debug(fmt.Sprintf("ServeHTTP:Get ip:%s isBanned:false %s", remoteIP, cacheErrString))

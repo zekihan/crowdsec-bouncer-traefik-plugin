@@ -168,8 +168,8 @@ func (c *Client) CommitRefresh(token string, entries map[string]SnapshotEntry, r
 
 // CommitRefreshContext rejects publication once cancellation has been observed.
 func (c *Client) CommitRefreshContext(ctx context.Context, token string, entries map[string]SnapshotEntry, removed []string, markerTTL int64) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	if contextErr := ctx.Err(); contextErr != nil {
+		return contextErr
 	}
 	for name := range entries {
 		if name == "updated" || name == "refresh:lease" || name == "refresh:snapshot" {
@@ -187,8 +187,8 @@ func (c *Client) CommitRefreshContext(ctx context.Context, token string, entries
 
 	refreshMemory.Lock()
 	defer refreshMemory.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
+	if contextErr := ctx.Err(); contextErr != nil {
+		return contextErr
 	}
 	if refreshMemory.token != token || !time.Now().Before(refreshMemory.until) {
 		return errors.New("cache:refresh lease lost")
@@ -229,8 +229,8 @@ func (rc *redisCache) commit(ctx context.Context, token string, entries map[stri
 	if err != nil {
 		return err
 	}
-	if err := ctx.Err(); err != nil {
-		return err
+	if contextErr := ctx.Err(); contextErr != nil {
+		return contextErr
 	}
 	result, err := rc.writer.Eval(commitRefresh, []string{rc.prefix + "refresh:lease", rc.prefix + "updated", rc.prefix + "refresh:snapshot"}, token, string(data), string(deleted), strconv.FormatInt(markerTTL, 10), rc.prefix)
 	if err != nil {

@@ -36,12 +36,12 @@ def command(*args, **kw):
     ).strip()
 
 
-def redis_command(port, *args):
+def redis_command(port, *args, database=11):
     with socket.create_connection(("127.0.0.1", port), timeout=4) as conn:
         conn.settimeout(4)
         reader = conn.makefile("rb")
         result = None
-        for values in [("AUTH", "admin", "fixture-admin"), ("SELECT", "11"), args]:
+        for values in [("AUTH", "admin", "fixture-admin"), ("SELECT", str(database)), args]:
             encoded = [str(a).encode() for a in values]
             conn.sendall(
                 b"*%d\r\n" % len(encoded)
@@ -123,7 +123,7 @@ class Suite:
     def request(self, ip="192.0.2.1", path="/live", method="GET", data=None):
         started = time.monotonic()
         try:
-            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+            conn = http.client.HTTPConnection("127.0.0.1", next(self.request_ports) if hasattr(self,"request_ports") else self.port, timeout=3)
             conn.request(
                 method,
                 path,
@@ -149,6 +149,8 @@ class Suite:
 
     def setup(self):
         command("docker", "network", "create", self.name)
+        # Application traffic uses whoami-open; fixture remains the synthetic LAPI.
+        self.run("whoami-open", "docker.io/traefik/whoami@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44")
         config = (
             'bind 0.0.0.0\nsave ""\nappendonly no\nuser default on >fixture-legacy ~* &* +@all\n'
             "user admin on >fixture-admin ~* &* +@all\n"
@@ -291,6 +293,8 @@ class Suite:
             plugin.update(
                 redisCacheUsername="crowdsec", redisCacheKeyPrefix="crowdsec:"
             )
+        if os.environ.get("CROWDSEC_TEST_POOL") == "1" and not baseline:
+            plugin.update(redisCachePoolMaxActive=4,redisCachePoolMaxIdle=4,redisCachePoolMaxWaiters=16,redisCachePoolIdleTimeoutSeconds=5,redisCachePoolMaxLifetimeSeconds=30)
         plugin.update(getattr(self, "overrides", {}))
         # Changed header ensures provider watches recreate the middleware.
         plugin["remediationHeadersCustomName"] = "X-Remediation-" + str(token)
@@ -319,7 +323,7 @@ class Suite:
                 },
                 "services": {
                     "backend": {
-                        "loadBalancer": {"servers": [{"url": "http://fixture:8080"}]}
+                        "loadBalancer": {"servers": [{"url": "http://whoami-open:80"}]}
                     }
                 },
                 "middlewares": {

@@ -16,7 +16,7 @@ import (
 func TestRetiredRefreshCancelsBlockedSnapshot(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		close(started)
 		<-release
 		_, _ = io.WriteString(w, `{"new":[{"value":"192.0.2.99","type":"ban","duration":"1m"}],"deleted":[]}`)
@@ -68,7 +68,11 @@ func TestCanceledRefreshBeforeFetchAndCommit(t *testing.T) {
 	if err != nil || token == "" {
 		t.Fatal(token, err)
 	}
-	defer storage.EndRefresh(token)
+	defer func() {
+		if releaseErr := storage.EndRefresh(token); releaseErr != nil {
+			t.Errorf("release refresh lease: %v", releaseErr)
+		}
+	}()
 	entries := map[string]cache.SnapshotEntry{"192.0.2.98": {Value: cache.BannedValue, Until: time.Now().Add(time.Minute).UnixMilli()}}
 	if err := storage.CommitRefreshContext(ctx, token, entries, nil, 60); err == nil {
 		t.Fatal("canceled refresh committed")

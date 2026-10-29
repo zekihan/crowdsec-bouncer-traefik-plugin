@@ -1,8 +1,7 @@
 diff --git a/vendor/github.com/maxlerebourg/simpleredis/simpleredis.go b/vendor/github.com/maxlerebourg/simpleredis/simpleredis.go
-index c939edb..7490117 100644
 --- a/vendor/github.com/maxlerebourg/simpleredis/simpleredis.go
 +++ b/vendor/github.com/maxlerebourg/simpleredis/simpleredis.go
-@@ -1,172 +1,178 @@
+@@ -1,172 +1,199 @@
 -// Package simpleredis implements utility routines for interacting.
 -// It supports currently the following operations: GET, SET, DELETE,
 -// and support timetoleave for keys.
@@ -11,6 +10,7 @@ index c939edb..7490117 100644
  
  import (
  	"bufio"
++	"context"
 +	"errors"
  	"fmt"
 +	"io"
@@ -39,15 +39,23 @@ index c939edb..7490117 100644
 -	Data     []byte
 -	Duration int64
 -	Error    error
--}
--
--// A SimpleRedis is used to communicate with redis.
-+// SimpleRedis opens one bounded connection per operation. Configure before use.
- type SimpleRedis struct {
- 	host     string
++// SimpleRedis uses bounded operations with optional connection reuse. Configure before use.
++type SimpleRedis struct {
++	host     string
 +	username string
- 	pass     string
- 	database string
++	pass     string
++	database string
++	pool     *connectionPool
+ }
+ 
+-// A SimpleRedis is used to communicate with redis.
+-type SimpleRedis struct {
+-	host     string
+-	pass     string
+-	database string
++// Init preserves password-only authentication for existing callers.
++func (sr *SimpleRedis) Init(host, pass, database string) {
++	sr.InitWithUsername(host, "", pass, database)
  }
  
 -func genRedisArray(params ...[]byte) []byte {
@@ -58,32 +66,16 @@ index c939edb..7490117 100644
 -	MSG = strings.Trim(MSG, " ")
 -	MSG = strings.Join([]string{MSG, "\r\n"}, "")
 -	return []byte(MSG)
-+// Init preserves password-only authentication for existing callers.
-+func (sr *SimpleRedis) Init(host, pass, database string) {
-+	sr.InitWithUsername(host, "", pass, database)
++// InitWithUsername selects an ACL identity; an empty username uses legacy AUTH.
++func (sr *SimpleRedis) InitWithUsername(host, username, pass, database string) {
++	sr.Close()
++	sr.pool = nil
++	sr.host, sr.username, sr.pass, sr.database = host, username, pass, database
  }
  
 -func send(wr *textproto.Writer, method string, data []byte) {
 -	if err := wr.PrintfLine(string(data)); err != nil {
 -		fmt.Printf("redis:%s  %s", method, err.Error())
--	}
-+// InitWithUsername selects an ACL identity; an empty username uses legacy AUTH.
-+func (sr *SimpleRedis) InitWithUsername(host, username, pass, database string) {
-+	sr.host, sr.username, sr.pass, sr.database = host, username, pass, database
- }
- 
--func (sr *SimpleRedis) waitRedis(reader *textproto.Reader, channel chan redisCmd) {
--	for {
--		select {
--		case <-time.After(time.Second * 1):
--			channel <- redisCmd{Error: fmt.Errorf(RedisTimeout)}
--			return
--		default:
--			read, _ := reader.ReadLineBytes()
--			if string(read) != "+OK" {
--				channel <- redisCmd{Error: fmt.Errorf(RedisNoAuth)}
--				return
--			}
 +func writeCommand(w *bufio.Writer, args ...string) error {
 +	if _, err := fmt.Fprintf(w, "*%d\r\n", len(args)); err != nil {
 +		return err
@@ -91,9 +83,7 @@ index c939edb..7490117 100644
 +	for _, arg := range args {
 +		if _, err := fmt.Fprintf(w, "$%d\r\n%s\r\n", len(arg), arg); err != nil {
 +			return err
- 		}
--		// breaks out of for
--		break
++		}
 +	}
 +	return w.Flush()
 +}
@@ -147,8 +137,18 @@ index c939edb..7490117 100644
  	}
  }
  
--func (sr *SimpleRedis) askRedis(cmd redisCmd, channel chan redisCmd) redisCmd {
--	dialer := net.Dialer{Timeout: 2 * time.Second}
+-func (sr *SimpleRedis) waitRedis(reader *textproto.Reader, channel chan redisCmd) {
+-	for {
+-		select {
+-		case <-time.After(time.Second * 1):
+-			channel <- redisCmd{Error: fmt.Errorf(RedisTimeout)}
+-			return
+-		default:
+-			read, _ := reader.ReadLineBytes()
+-			if string(read) != "+OK" {
+-				channel <- redisCmd{Error: fmt.Errorf(RedisNoAuth)}
+-				return
+-			}
 +func exchange(w *bufio.Writer, r *bufio.Reader, expected byte, args ...string) ([]byte, error) {
 +	if err := writeCommand(w, args...); err != nil {
 +		return nil, err
@@ -157,17 +157,24 @@ index c939edb..7490117 100644
 +	if err != nil {
 +		if err.Error() == RedisMiss && expected != '$' {
 +			return nil, errors.New("redis:unexpected reply")
-+		}
+ 		}
+-		// breaks out of for
+-		break
 +		return nil, err
-+	}
+ 	}
 +	if kind != expected || (expected == '+' && string(data) != "OK") ||
 +		(expected == ':' && string(data) != "0" && string(data) != "1") {
 +		return nil, errors.New("redis:unexpected reply")
 +	}
 +	return data, nil
-+}
-+
+ }
+ 
+-func (sr *SimpleRedis) askRedis(cmd redisCmd, channel chan redisCmd) redisCmd {
+-	dialer := net.Dialer{Timeout: 2 * time.Second}
 +func (sr *SimpleRedis) execute(expected byte, args ...string) ([]byte, error) {
++	if sr.pool != nil {
++		return sr.executePooled(context.Background(), expected, args...)
++	}
 +	deadline := time.Now().Add(operationTimeout)
 +	dialer := net.Dialer{Deadline: deadline}
  	conn, err := dialer.Dial("tcp", sr.host)
@@ -178,15 +185,7 @@ index c939edb..7490117 100644
 -	defer func() {
 -		if err := conn.Close(); err != nil {
 -			fmt.Printf("redis:connClose %s", err.Error())
-+	defer conn.Close()
-+	if err := conn.SetDeadline(deadline); err != nil {
-+		return nil, err
-+	}
-+	data, err := sr.executeConnection(conn, expected, args...)
-+	if err != nil {
-+		if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
-+			return nil, errors.New(RedisTimeout)
- 		}
+-		}
 -	}()
 -
 -	writer := textproto.NewWriter(bufio.NewWriter(conn))
@@ -196,22 +195,12 @@ index c939edb..7490117 100644
 -		data := genRedisArray([]byte("AUTH"), []byte(sr.pass))
 -		send(writer, "auth", data)
 -		sr.waitRedis(reader, channel)
++	defer conn.Close()
++	if err := conn.SetDeadline(deadline); err != nil {
++		return nil, err
  	}
-+	return data, err
-+}
- 
-+func (sr *SimpleRedis) executeConnection(conn net.Conn, expected byte, args ...string) ([]byte, error) {
-+	w, r := bufio.NewWriter(conn), bufio.NewReader(conn)
-+	if sr.username != "" || sr.pass != "" {
-+		auth := []string{"AUTH", sr.pass}
-+		if sr.username != "" {
-+			auth = []string{"AUTH", sr.username, sr.pass}
-+		}
-+		if _, err := exchange(w, r, '+', auth...); err != nil {
-+			return nil, err
-+		}
-+	}
- 	if sr.database != "" {
+-
+-	if sr.database != "" {
 -		data := genRedisArray([]byte("SELECT"), []byte(sr.database))
 -		send(writer, "select", data)
 -		sr.waitRedis(reader, channel)
@@ -242,12 +231,14 @@ index c939edb..7490117 100644
 -				read, _ = reader.ReadLineBytes()
 -				return redisCmd{Data: read}
 -			}
-+		if _, err := exchange(w, r, '+', "SELECT", sr.database); err != nil {
-+			return nil, err
++	data, err := sr.executeConnection(conn, expected, args...)
++	if err != nil {
++		if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
++			return nil, errors.New(RedisTimeout)
  		}
  	}
 -	return redisCmd{Error: fmt.Errorf(RedisIssue)}
-+	return exchange(w, r, expected, args...)
++	return data, err
  }
  
 -// Init sets the redisHost used to connect to redis.
@@ -255,14 +246,32 @@ index c939edb..7490117 100644
 -	sr.host = host
 -	sr.pass = pass
 -	sr.database = database
--}
--
++func (sr *SimpleRedis) executeConnection(conn net.Conn, expected byte, args ...string) ([]byte, error) {
++	w, r := bufio.NewWriter(conn), bufio.NewReader(conn)
++	if err := sr.authenticate(w, r); err != nil {
++		return nil, err
++	}
++	if err := sr.selectDatabase(w, r); err != nil {
++		return nil, err
++	}
++	return exchange(w, r, expected, args...)
+ }
+ 
 -// Get fetches the value for key name in redis.
 -func (sr *SimpleRedis) Get(name string) ([]byte, error) {
 -	cmd := redisCmd{
 -		Command: "GET",
 -		Name:    name,
--	}
++func (sr *SimpleRedis) authenticate(w *bufio.Writer, r *bufio.Reader) error {
++	if sr.username != "" || sr.pass != "" {
++		auth := []string{"AUTH", sr.pass}
++		if sr.username != "" {
++			auth = []string{"AUTH", sr.username, sr.pass}
++		}
++		if _, err := exchange(w, r, '+', auth...); err != nil {
++			return err
++		}
+ 	}
 -	channel := make(chan redisCmd)
 -	resp := sr.askRedis(cmd, channel)
 -	if resp.Error != nil {
@@ -272,8 +281,7 @@ index c939edb..7490117 100644
 -}
 -
 -// Set updates the value for key name in redis with value data for duration.
-+func (sr *SimpleRedis) Get(name string) ([]byte, error) { return sr.execute('$', "GET", name) }
- func (sr *SimpleRedis) Set(name string, data []byte, duration int64) error {
+-func (sr *SimpleRedis) Set(name string, data []byte, duration int64) error {
 -	cmd := redisCmd{
 -		Command:  "SET",
 -		Name:     name,
@@ -281,13 +289,7 @@ index c939edb..7490117 100644
 -		Duration: duration,
 -	}
 -	sr.askRedis(cmd, nil)
--	return nil
-+	_, err := sr.execute('+', "SET", name, string(data), "EX", strconv.FormatInt(duration, 10))
-+	return err
-+}
-+func (sr *SimpleRedis) Del(name string) error {
-+	_, err := sr.execute(':', "DEL", name)
-+	return err
+ 	return nil
  }
  
 -// Del removes the key name in redis.
@@ -295,9 +297,26 @@ index c939edb..7490117 100644
 -	cmd := redisCmd{
 -		Command: "DEL",
 -		Name:    name,
--	}
++func (sr *SimpleRedis) selectDatabase(w *bufio.Writer, r *bufio.Reader) error {
++	if sr.database != "" {
++		if _, err := exchange(w, r, '+', "SELECT", sr.database); err != nil {
++			return err
++		}
+ 	}
 -	sr.askRedis(cmd, nil)
--	return nil
+ 	return nil
+ }
++
++func (sr *SimpleRedis) Get(name string) ([]byte, error) { return sr.execute('$', "GET", name) }
++func (sr *SimpleRedis) Set(name string, data []byte, duration int64) error {
++	_, err := sr.execute('+', "SET", name, string(data), "EX", strconv.FormatInt(duration, 10))
++	return err
++}
++func (sr *SimpleRedis) Del(name string) error {
++	_, err := sr.execute(':', "DEL", name)
++	return err
++}
++
 +// Eval runs a bounded script returning a bulk string. Keys remain subject to ACL checks.
 +func (sr *SimpleRedis) Eval(script string, keys []string, args ...string) (string, error) {
 +	command := []string{"EVAL", script, strconv.Itoa(len(keys))}
@@ -305,4 +324,271 @@ index c939edb..7490117 100644
 +	command = append(command, args...)
 +	value, err := sr.execute('$', command...)
 +	return string(value), err
- }
++}
+diff --git a/vendor/github.com/maxlerebourg/simpleredis/pool.go b/vendor/github.com/maxlerebourg/simpleredis/pool.go
+new file mode 100644
+--- /dev/null
++++ b/vendor/github.com/maxlerebourg/simpleredis/pool.go
+@@ -0,0 +1,262 @@
++package simpleredis
++
++import (
++	"bufio"
++	"context"
++	"errors"
++	"net"
++	"sync"
++	"time"
++)
++
++// PoolOptions bounds resources per client identity/database. Pooling is disabled
++// until ConfigurePool succeeds. Configure before use.
++type PoolOptions struct {
++	MaxActive   int
++	MaxIdle     int
++	MaxWaiters  int
++	IdleTimeout time.Duration
++	MaxLifetime time.Duration
++}
++
++type pooledConnection struct {
++	conn      net.Conn
++	reader    *bufio.Reader
++	writer    *bufio.Writer
++	born      time.Time
++	idleSince time.Time
++}
++
++type connectionPool struct {
++	options PoolOptions
++	slots   chan struct{}
++	waiters chan struct{}
++	done    chan struct{}
++	stopped chan struct{}
++	mu      sync.Mutex
++	closed  bool
++	idle    []*pooledConnection
++	all     map[*pooledConnection]bool
++}
++
++// ConfigurePool replaces and closes any previous pool. Init and ConfigurePool
++// must not race with operations; Close is safe during operations and idempotent.
++func (sr *SimpleRedis) ConfigurePool(options PoolOptions) error {
++	if (sr.username == "" && sr.pass == "") || sr.database == "" {
++		return errors.New("redis:pool requires authentication and explicit database")
++	}
++
++	if options.MaxActive < 1 || options.MaxIdle < 0 || options.MaxIdle > options.MaxActive || options.MaxWaiters < 0 || options.IdleTimeout <= 0 || options.MaxLifetime <= 0 {
++		return errors.New("redis:invalid pool options")
++	}
++	sr.Close()
++	p := &connectionPool{options: options, slots: make(chan struct{}, options.MaxActive), waiters: make(chan struct{}, options.MaxWaiters), done: make(chan struct{}), stopped: make(chan struct{}), all: make(map[*pooledConnection]bool)}
++	sr.pool = p
++	go p.reap()
++	return nil
++}
++
++// Close retires the pool, closes idle and borrowed sockets and wakes waiters.
++// Subsequent operations on this pooled client fail until it is reinitialized.
++func (sr *SimpleRedis) Close() {
++	if sr.pool == nil {
++		return
++	}
++	p := sr.pool
++	p.mu.Lock()
++	if !p.closed {
++		p.closed = true
++		close(p.done)
++		for c := range p.all {
++			c.conn.Close()
++			delete(p.all, c)
++		}
++		p.idle = nil
++	}
++	p.mu.Unlock()
++	<-p.stopped
++}
++
++func (p *connectionPool) expired(c *pooledConnection, now time.Time) bool {
++	return now.Sub(c.born) >= p.options.MaxLifetime || now.Sub(c.idleSince) >= p.options.IdleTimeout
++}
++
++func (p *connectionPool) reap() {
++	defer close(p.stopped)
++	interval := p.options.IdleTimeout
++	if p.options.MaxLifetime < interval {
++		interval = p.options.MaxLifetime
++	}
++	ticker := time.NewTicker(interval)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-p.done:
++			return
++		case now := <-ticker.C:
++			p.mu.Lock()
++			kept := p.idle[:0]
++			for _, c := range p.idle {
++				if p.expired(c, now) {
++					c.conn.Close()
++					delete(p.all, c)
++				} else {
++					kept = append(kept, c)
++				}
++			}
++			p.idle = kept
++			p.mu.Unlock()
++		}
++	}
++}
++
++func (p *connectionPool) acquire(ctx context.Context) error {
++	select {
++	case <-p.done:
++		return errors.New(RedisUnreachable)
++	default:
++	}
++	select {
++	case p.slots <- struct{}{}:
++		return nil
++	default:
++	}
++	select {
++	case p.waiters <- struct{}{}:
++		defer func() { <-p.waiters }()
++	default:
++		return errors.New(RedisUnreachable)
++	}
++	select {
++	case p.slots <- struct{}{}:
++		return nil
++	case <-p.done:
++		return errors.New(RedisUnreachable)
++	case <-ctx.Done():
++		if ctx.Err() == context.DeadlineExceeded {
++			return errors.New(RedisTimeout)
++		}
++		return ctx.Err()
++	}
++}
++
++func (p *connectionPool) take() *pooledConnection {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	for len(p.idle) > 0 {
++		n := len(p.idle) - 1
++		c := p.idle[n]
++		p.idle = p.idle[:n]
++		if !p.expired(c, time.Now()) {
++			return c
++		}
++		c.conn.Close()
++		delete(p.all, c)
++	}
++	return nil
++}
++
++func (p *connectionPool) release(c *pooledConnection, healthy bool) {
++	p.mu.Lock()
++	if healthy && !p.closed && time.Since(c.born) < p.options.MaxLifetime && len(p.idle) < p.options.MaxIdle {
++		c.idleSince = time.Now()
++		p.idle = append(p.idle, c)
++	} else {
++		c.conn.Close()
++		delete(p.all, c)
++	}
++	p.mu.Unlock()
++}
++
++func (sr *SimpleRedis) executePooled(ctx context.Context, expected byte, args ...string) ([]byte, error) {
++	ctx, cancel := context.WithTimeout(ctx, operationTimeout)
++	defer cancel()
++	p := sr.pool
++	if err := p.acquire(ctx); err != nil {
++		return nil, err
++	}
++	defer func() { <-p.slots }()
++	if err := ctx.Err(); err != nil {
++		if err == context.DeadlineExceeded {
++			return nil, errors.New(RedisTimeout)
++		}
++		return nil, err
++	}
++	c := p.take()
++	if c == nil {
++		d := net.Dialer{}
++		conn, err := d.DialContext(ctx, "tcp", sr.host)
++		if err != nil {
++			return nil, errors.New(RedisUnreachable)
++		}
++		c = &pooledConnection{conn: conn, reader: bufio.NewReader(conn), writer: bufio.NewWriter(conn), born: time.Now()}
++		p.mu.Lock()
++		if p.closed {
++			p.mu.Unlock()
++			conn.Close()
++			return nil, errors.New(RedisUnreachable)
++		}
++		p.all[c] = true
++		p.mu.Unlock()
++	}
++	healthy := false
++	defer func() { p.release(c, healthy) }()
++	deadline, _ := ctx.Deadline()
++	if err := c.conn.SetDeadline(deadline); err != nil {
++		return nil, err
++	}
++	// Join the cancellation watcher before returning the socket to the pool.
++	finished, joined := make(chan struct{}), make(chan struct{})
++	go func() {
++		defer close(joined)
++		select {
++		case <-ctx.Done():
++			c.conn.Close()
++		case <-finished:
++		}
++	}()
++	defer func() {
++		close(finished)
++		<-joined
++		if ctx.Err() != nil {
++			healthy = false
++		}
++	}()
++	var data []byte
++	var err error
++	// Reauthenticate and reselect every checkout to preserve password and
++	// command-ACL revocation behavior, including revocation of SELECT.
++	err = sr.authenticate(c.writer, c.reader)
++	if err == nil {
++		err = sr.selectDatabase(c.writer, c.reader)
++	}
++	if err == nil {
++		data, err = exchange(c.writer, c.reader, expected, args...)
++	}
++	healthy = (err == nil || (err != nil && err.Error() == RedisMiss)) && c.reader.Buffered() == 0
++	if ctx.Err() != nil {
++		healthy = false
++		if ctx.Err() == context.DeadlineExceeded {
++			return nil, errors.New(RedisTimeout)
++		}
++		return nil, ctx.Err()
++	}
++	if err != nil {
++		if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
++			return nil, errors.New(RedisTimeout)
++		}
++	}
++	return data, err
++}
++
++// GetContext cancels pooled operations while waiting, dialing and reading.
++// Unpooled operations retain their legacy deadline after an initial context check.
++func (sr *SimpleRedis) GetContext(ctx context.Context, name string) ([]byte, error) {
++	if sr.pool == nil {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		return sr.Get(name)
++	}
++	return sr.executePooled(ctx, '$', "GET", name)
++}

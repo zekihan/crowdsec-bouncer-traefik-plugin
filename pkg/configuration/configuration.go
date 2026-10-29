@@ -94,6 +94,11 @@ type Config struct {
 	ForwardedHeadersCustomName                 string   `json:"forwardedHeadersCustomName,omitempty"`
 	ForwardedHeadersTrustedIPs                 []string `json:"forwardedHeadersTrustedIps,omitempty"`
 	ClientTrustedIPs                           []string `json:"clientTrustedIps,omitempty"`
+	RedisCachePoolMaxActive                    int      `json:"redisCachePoolMaxActive,omitempty"`
+	RedisCachePoolMaxIdle                      int      `json:"redisCachePoolMaxIdle,omitempty"`
+	RedisCachePoolMaxWaiters                   int      `json:"redisCachePoolMaxWaiters,omitempty"`
+	RedisCachePoolIdleTimeoutSeconds           int      `json:"redisCachePoolIdleTimeoutSeconds,omitempty"`
+	RedisCachePoolMaxLifetimeSeconds           int      `json:"redisCachePoolMaxLifetimeSeconds,omitempty"`
 	RedisCacheUsername                         string   `json:"redisCacheUsername,omitempty"`
 	RedisCacheKeyPrefix                        string   `json:"redisCacheKeyPrefix,omitempty"`
 	RedisCacheEnabled                          bool     `json:"redisCacheEnabled,omitempty"`
@@ -481,7 +486,7 @@ func validateParamsRequired(config *Config) error {
 	if !contains([]string{HTTP, HTTPS, ""}, config.CrowdsecAppsecScheme) {
 		return errors.New("CrowdsecAppsecScheme: must be one of 'http' or 'https'")
 	}
-	return nil
+	return validateRedisPool(config)
 }
 
 func getTLSConfig(config *Config, log *slog.Logger, prefix, scheme string, insecureVerify bool) (*tls.Config, error) {
@@ -542,4 +547,13 @@ func GetTLSConfigCrowdsec(config *Config, log *slog.Logger, isAppsec bool) (*tls
 	}
 	prefix = "CrowdsecLapi"
 	return getTLSConfig(config, log, prefix, config.CrowdsecLapiScheme, config.CrowdsecLapiTLSInsecureVerify)
+}
+
+func validateRedisPool(config *Config) error {
+	if config.RedisCachePoolMaxActive != 0 || config.RedisCachePoolMaxIdle != 0 || config.RedisCachePoolMaxWaiters != 0 || config.RedisCachePoolIdleTimeoutSeconds != 0 || config.RedisCachePoolMaxLifetimeSeconds != 0 {
+		if config.RedisCachePoolMaxActive < 1 || config.RedisCachePoolMaxIdle < 0 || config.RedisCachePoolMaxIdle > config.RedisCachePoolMaxActive || config.RedisCachePoolMaxWaiters < 0 || config.RedisCachePoolIdleTimeoutSeconds < 1 || config.RedisCachePoolMaxLifetimeSeconds < 1 {
+			return errors.New("invalid Redis connection pool bounds")
+		}
+	}
+	return nil
 }

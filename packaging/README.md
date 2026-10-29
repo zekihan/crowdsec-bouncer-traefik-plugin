@@ -132,3 +132,62 @@ synthetic boundary regressions without Docker:
 ```sh
 python3 -m unittest discover -s tests/acceptance -p test_load.py
 ```
+
+## OPS-160 opt-in connection pool candidate
+
+Pooling stays disabled unless all required bounds are explicitly configured:
+`redisCachePoolMaxActive`, `redisCachePoolMaxIdle`,
+`redisCachePoolMaxWaiters`, `redisCachePoolIdleTimeoutSeconds` and
+`redisCachePoolMaxLifetimeSeconds`. Zero active with all other values zero keeps
+legacy behavior. Invalid or incomplete bounds fail configuration validation.
+The limits apply to each reader/writer endpoint of each middleware instance,
+and multiply again across Traefik processes. Do not copy synthetic test limits
+into production without its concurrency/resource evidence.
+
+Each socket belongs to one initialized endpoint, identity and database. AUTH
+runs on every checkout to preserve immediate password revocation; SELECT also runs on every checkout to preserve command-ACL revocation.
+The savings are TCP/DNS churn and buffer allocation; AUTH/SELECT rates remain. No stale decision cache, retry or command replay is
+added. Waiting, DNS/dialing, AUTH, SELECT and command I/O share the existing
+1.9-second operation budget. Request cancellation interrupts pooled lookups.
+Queue overflow follows the existing unreachable failure branch. Retirement
+first lets the canceled refresh release its fenced lease, then closes its pools.
+
+Regenerate the tracked vendor patch from the actual client source, then vendor:
+
+```sh
+python3 packaging/update-simpleredis-patch.py /path/to/simpleredis
+make vendor
+cmp vendor/github.com/maxlerebourg/simpleredis/simpleredis.go /path/to/simpleredis/simpleredis.go
+cmp vendor/github.com/maxlerebourg/simpleredis/pool.go /path/to/simpleredis/pool.go
+```
+
+The patch generator currently targets the pinned upstream v1.0.12. A dependency
+upgrade requires reviewing its base as well as the resulting patch. The new
+library source remains authoritative; editing only `vendor/` is insufficient.
+
+`CROWDSEC_TEST_POOL=1` opts the disposable acceptance fixtures into synthetic
+bounds (4 active/idle, 16 waiters, 5-second idle, 30-second lifetime per endpoint).
+Application traffic uses a digest-pinned `whoami-open` container. The fixture
+still provides synthetic LAPI/CAPTCHA and Redis fault injection.
+
+Additional acceptance commands:
+
+```sh
+python3 tests/acceptance/pool_credentials.py --artifact local/crowdsec-plugin:ops-160-v7 --output /tmp/pool-credentials
+python3 tests/acceptance/pool_benchmark.py --candidate local/crowdsec-plugin:ops-160-v7 --output /tmp/pool-comparison
+```
+
+The benchmark compares the same artifact with pooling disabled/enabled by
+default. `--baseline <image>` permits an explicitly different reference artifact;
+that comparison includes all intervening source differences. It alternates
+three pairs, with two Traefik processes and traffic to both middleware instances,
+then checks idle bounds. Redis rates include the documented admin sampling
+connections. DNS query packets are counted by a sidecar with NET_RAW confined
+to each disposable Traefik network namespace; only query names/counts are logged.
+It never captures production traffic. These synthetic comparisons do not replace
+the separately named long paired suite or 30-minute fault soak. No publication,
+GitOps promotion or production verification is implied by a local test.
+
+Pooling requires an initialized authentication identity (username or password)
+and an explicit database, including `0` for the default database. Unpooled legacy
+clients retain their existing anonymous/default-database behavior.

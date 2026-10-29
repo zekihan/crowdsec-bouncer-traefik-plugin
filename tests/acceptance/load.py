@@ -24,7 +24,7 @@ def expected_response(code, duration, expected, started, finished, faults):
     return faults and expected == 200 and code == 403 and fault_exposure
 
 
-def drive(suite, seconds, label, faults=False):
+def drive(suite, seconds, label, faults=False, rate=100):
     start = time.monotonic()
     offset = getattr(suite, "corpus_offset", 0)
     samples = []
@@ -96,7 +96,7 @@ def drive(suite, seconds, label, faults=False):
                     unexpected=len(unexpected),
                 )
                 status_at += 60
-            target = start + count / 100
+            target = start + count / rate
             if now < target:
                 time.sleep(target - now)
             elif now - target > 0.1:
@@ -119,6 +119,7 @@ def drive(suite, seconds, label, faults=False):
         "unexpected_count": len(unexpected),
         "examples": unexpected[:10],
         "max": maximum,
+        "p50": percentile(durations, 0.5),
         "p95": percentile(durations, 0.95),
         "p99": percentile(durations, 0.99),
         "samples": samples,

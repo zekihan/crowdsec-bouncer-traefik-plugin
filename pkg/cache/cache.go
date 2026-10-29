@@ -3,10 +3,12 @@
 package cache
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
+	"time"
 
 	ttl_map "github.com/leprosus/golang-ttl-map"
 	simpleredis "github.com/maxlerebourg/simpleredis"
@@ -120,6 +122,7 @@ func (c *Client) New(log *slog.Logger, isRedis bool, writeHost string, readHosts
 
 // NewWithACL configures an isolated Redis identity and key namespace.
 func (c *Client) NewWithACL(log *slog.Logger, isRedis bool, writeHost string, readHosts []string, username, pass, database, prefix string) {
+	c.Close()
 	c.log = log
 	if isRedis {
 		rc := &redisCache{log: log, prefix: prefix}
@@ -153,4 +156,58 @@ func (c *Client) Get(key string) (string, error) {
 func (c *Client) Set(key string, value string, duration int64) error {
 	c.log.Debug(fmt.Sprintf("cache:Set key:%v value:%v duration:%vs", key, value, duration))
 	return c.cache.set(key, value, duration)
+}
+
+// ConfigurePool enables bounded connection reuse for each Redis endpoint.
+func (c *Client) ConfigurePool(maxActive, maxIdle, maxWaiters, idleSeconds, lifetimeSeconds int) error {
+	rc, ok := c.cache.(*redisCache)
+	if !ok {
+		return nil
+	}
+	options := simpleredis.PoolOptions{MaxActive: maxActive, MaxIdle: maxIdle, MaxWaiters: maxWaiters, IdleTimeout: time.Duration(idleSeconds) * time.Second, MaxLifetime: time.Duration(lifetimeSeconds) * time.Second}
+	if err := rc.writer.ConfigurePool(options); err != nil {
+		return err
+	}
+	for i := range rc.readers {
+		if err := rc.readers[i].ConfigurePool(options); err != nil {
+			c.Close()
+			return err
+		}
+	}
+	return nil
+}
+
+// Close retires all Redis endpoint pools owned by this middleware instance.
+func (c *Client) Close() {
+	rc, ok := c.cache.(*redisCache)
+	if !ok {
+		return
+	}
+	rc.writer.Close()
+	for i := range rc.readers {
+		rc.readers[i].Close()
+	}
+}
+
+// GetContext cancels pooled request lookups without retaining a borrowed socket.
+func (c *Client) GetContext(ctx context.Context, key string) (string, error) {
+	rc, ok := c.cache.(*redisCache)
+	if !ok {
+		return c.Get(key)
+	}
+	c.log.Debug(fmt.Sprintf("cache:Get key:%v", key))
+	value, err := rc.nextReader().GetContext(ctx, rc.prefix+key)
+	if err != nil {
+		switch err.Error() {
+		case simpleredis.RedisMiss:
+			return "", errors.New(CacheMiss)
+		case simpleredis.RedisUnreachable:
+			return "", errors.New(CacheUnreachable)
+		}
+		return "", err
+	}
+	if len(value) == 0 {
+		return "", errors.New(CacheMiss)
+	}
+	return string(value), nil
 }
